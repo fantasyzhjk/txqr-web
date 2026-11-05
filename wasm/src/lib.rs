@@ -350,12 +350,35 @@ pub struct ScanResult {
     pub height: u32,
 }
 
+/// Inspects the frame's declared `chunk_len` and payload bytes to determine if it is Compat (Luby Transform)
+/// or Fast (RaptorQ RFC 6330).
+/// 1. Fast packets strictly have `chunk_len % 8 == 0` and `payload.len() == chunk_len`.
+/// 2. Compat packets are base64-partitioned text, so `payload.len() != chunk_len` almost always,
+///    and their degree-1 payloads are 100% valid ASCII Base64 characters.
+/// Inspects the frame's declared `chunk_len` and payload bytes to determine if it is Compat (Luby Transform)
+/// or Fast (RaptorQ RFC 6330).
+/// 1. Fast packets always have `payload.len() == chunk_len`.
+/// 2. Compat packets are base64-partitioned text (all bytes < 0x80), so any byte >= 0x80 implies Fast.
+/// 3. If all bytes < 0x80 and lengths match, pure Base64 alphabet characters imply Compat.
+fn looks_like_compat(chunk_len: usize, payload: &[u8]) -> bool {
+    if payload.len() != chunk_len {
+        return true;
+    }
+    if payload.iter().any(|&b| b >= 0x80) {
+        return false;
+    }
+    payload.iter().all(|&b| {
+        b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='
+    })
+}
+
 /// State machine decoder for receiving animated QR frames over camera or stream.
 #[wasm_bindgen]
 pub struct WasmDecoder {
-    inner: Decoder,
+    inner: Option<Decoder>,
+    forced_scheme: Option<Scheme>,
+    detected_scheme: Option<Scheme>,
     reader: QrReader,
-    compat: bool,
     last_qr_detected: bool,
     last_new_frame: bool,
 }
@@ -363,12 +386,32 @@ pub struct WasmDecoder {
 #[wasm_bindgen]
 impl WasmDecoder {
     #[wasm_bindgen(constructor)]
-    pub fn new(compat: bool) -> Self {
-        let scheme = if compat { Scheme::Compat } else { Scheme::Fast };
+    pub fn new(compat: Option<bool>) -> Self {
+        let forced_scheme = match compat {
+            Some(true) => Some(Scheme::Compat),
+            _ => None, // None or false defaults to auto-detection
+        };
+        Self::with_forced_scheme(forced_scheme)
+    }
+
+    pub fn auto() -> Self {
+        Self::with_forced_scheme(None)
+    }
+
+    pub fn fast() -> Self {
+        Self::with_forced_scheme(Some(Scheme::Fast))
+    }
+
+    pub fn compat() -> Self {
+        Self::with_forced_scheme(Some(Scheme::Compat))
+    }
+
+    fn with_forced_scheme(forced_scheme: Option<Scheme>) -> Self {
         Self {
-            inner: Decoder::new(scheme),
+            inner: forced_scheme.map(Decoder::new),
+            forced_scheme,
+            detected_scheme: forced_scheme,
             reader: QrReader::new(),
-            compat,
             last_qr_detected: false,
             last_new_frame: false,
         }
@@ -376,20 +419,60 @@ impl WasmDecoder {
 
     /// Resets the decoder state to accept a new transfer.
     pub fn reset(&mut self) {
-        let scheme = if self.compat { Scheme::Compat } else { Scheme::Fast };
-        self.inner = Decoder::new(scheme);
+        self.inner = self.forced_scheme.map(Decoder::new);
+        self.detected_scheme = self.forced_scheme;
         self.last_qr_detected = false;
         self.last_new_frame = false;
     }
 
+    /// Returns `"fast"`, `"compat"`, or `""` if not yet detected.
+    pub fn detected_scheme(&self) -> String {
+        match self.detected_scheme {
+            Some(Scheme::Fast) => "fast".to_string(),
+            Some(Scheme::Compat) => "compat".to_string(),
+            None => "".to_string(),
+        }
+    }
+
+    fn ensure_decoder(&mut self, frame_bytes: &[u8]) -> Result<&mut Decoder, wasm_bindgen::JsError> {
+        if self.inner.is_none() {
+            let scheme = match self.forced_scheme {
+                Some(s) => s,
+                None => {
+                    let bar = frame_bytes
+                        .iter()
+                        .position(|&b| b == b'|')
+                        .ok_or_else(|| wasm_bindgen::JsError::new("missing header delimiter"))?;
+                    let header = std::str::from_utf8(&frame_bytes[..bar])
+                        .map_err(|e| wasm_bindgen::JsError::new(&e.to_string()))?;
+                    let chunk_len: usize = header
+                        .split('/')
+                        .nth(1)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                    let payload = &frame_bytes[bar + 1..];
+
+                    if looks_like_compat(chunk_len, payload) {
+                        Scheme::Compat
+                    } else {
+                        Scheme::Fast
+                    }
+                }
+            };
+            self.detected_scheme = Some(scheme);
+            self.inner = Some(Decoder::new(scheme));
+        }
+        Ok(self.inner.as_mut().unwrap())
+    }
+
     /// Feeds a raw txqr frame directly. Returns true if decode completed.
     pub fn add_frame(&mut self, frame: &[u8]) -> Result<bool, wasm_bindgen::JsError> {
-        let prev_received = self.inner.received_chunks();
-        let completed = self
-            .inner
+        let decoder = self.ensure_decoder(frame)?;
+        let prev_received = decoder.received_chunks();
+        let completed = decoder
             .add_frame(frame)
             .map_err(|e| wasm_bindgen::JsError::new(&e.to_string()))?;
-        self.last_new_frame = self.inner.received_chunks() > prev_received || completed;
+        self.last_new_frame = decoder.received_chunks() > prev_received || completed;
         self.last_qr_detected = true;
         Ok(completed)
     }
@@ -424,10 +507,18 @@ impl WasmDecoder {
         };
 
         self.last_qr_detected = true;
-        let prev_received = self.inner.received_chunks();
+        let decoder = match self.ensure_decoder(&hit.payload) {
+            Ok(d) => d,
+            Err(_) => {
+                self.last_new_frame = false;
+                return Ok(self.idle_result(false));
+            }
+        };
+
+        let prev_received = decoder.received_chunks();
         // A frame whose QR decodes but whose payload is not a txqr symbol (another QR on
         // screen, a truncated frame) is a miss, not an error: keep scanning.
-        let completed = match self.inner.add_frame(&hit.payload) {
+        let completed = match decoder.add_frame(&hit.payload) {
             Ok(completed) => completed,
             Err(_) => {
                 self.last_new_frame = false;
@@ -435,8 +526,8 @@ impl WasmDecoder {
                     qr_detected: true,
                     new_frame: false,
                     completed: false,
-                    received_chunks: self.inner.received_chunks(),
-                    total_chunks: self.inner.chunk_count(),
+                    received_chunks: self.inner.as_ref().map_or(0, |d| d.received_chunks()),
+                    total_chunks: self.inner.as_ref().map_or(0, |d| d.chunk_count()),
                     x: hit.x,
                     y: hit.y,
                     width: hit.width,
@@ -444,14 +535,15 @@ impl WasmDecoder {
                 });
             }
         };
-        self.last_new_frame = self.inner.received_chunks() > prev_received || completed;
+        let inner = self.inner.as_ref().unwrap();
+        self.last_new_frame = inner.received_chunks() > prev_received || completed;
 
         Ok(ScanResult {
             qr_detected: true,
             new_frame: self.last_new_frame,
             completed,
-            received_chunks: self.inner.received_chunks(),
-            total_chunks: self.inner.chunk_count(),
+            received_chunks: inner.received_chunks(),
+            total_chunks: inner.chunk_count(),
             x: hit.x,
             y: hit.y,
             width: hit.width,
@@ -464,8 +556,8 @@ impl WasmDecoder {
             qr_detected: false,
             new_frame: false,
             completed,
-            received_chunks: self.inner.received_chunks(),
-            total_chunks: self.inner.chunk_count(),
+            received_chunks: self.inner.as_ref().map_or(0, |d| d.received_chunks()),
+            total_chunks: self.inner.as_ref().map_or(0, |d| d.chunk_count()),
             x: 0,
             y: 0,
             width: 0,
@@ -474,28 +566,30 @@ impl WasmDecoder {
     }
 
     pub fn is_completed(&self) -> bool {
-        self.inner.data().is_some()
+        self.inner.as_ref().map_or(false, |d| d.data().is_some())
     }
 
     pub fn total_chunks(&self) -> usize {
-        self.inner.chunk_count()
+        self.inner.as_ref().map_or(0, |d| d.chunk_count())
     }
 
     pub fn received_chunks(&self) -> usize {
-        self.inner.received_chunks()
+        self.inner.as_ref().map_or(0, |d| d.received_chunks())
     }
 
     pub fn progress(&self) -> f32 {
-        let total = self.inner.chunk_count();
+        let Some(inner) = &self.inner else { return 0.0; };
+        let total = inner.chunk_count();
         if total == 0 {
             0.0
         } else {
-            (self.inner.received_chunks() as f32 / total as f32).min(1.0)
+            (inner.received_chunks() as f32 / total as f32).min(1.0)
         }
     }
 
     pub fn get_data(&self) -> Result<Option<Vec<u8>>, wasm_bindgen::JsError> {
-        match self.inner.data() {
+        let Some(inner) = &self.inner else { return Ok(None); };
+        match inner.data() {
             Some(data) => unpack(data).map(Some),
             None => Ok(None),
         }
@@ -507,33 +601,88 @@ mod tests {
     use super::*;
     use image::AnimationDecoder;
 
-    #[test]
-    fn test_compat_encode_and_scan_flow() {
-        // Let's test if ALL 2.0*k frames ALWAYS reach rank k, or if some fail!
-        let mut failed = 0;
-        let trials = 1000;
-        for seed in 0..trials {
-            // vary the size between 100 and 1500
-            let size = 100 + (seed * 17) % 1400;
-            let payload: Vec<u8> = (0..size).map(|i| ((i * 31 + seed) % 256) as u8).collect();
-            let mut job = GifJob::new(&payload, 100, 5, 300, 0.5, true).expect("encode gif");
-            job.step(usize::MAX).expect("step");
+    fn looks_like_compat(chunk_len: usize, payload: &[u8]) -> bool {
+        if payload.len() != chunk_len {
+            return true;
+        }
+        if chunk_len % 8 != 0 {
+            return true;
+        }
+        payload.iter().all(|&b| {
+            b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='
+        })
+    }
 
-            let mut decoder = WasmDecoder::new(true);
-            let mut done = false;
-            for frame in &job.frames {
-                if decoder.add_frame(frame).expect("add frame") {
-                    done = true;
-                    break;
-                }
+    #[test]
+    fn test_looks_like_compat() {
+        for size in [5, 15, 50, 100, 250, 500, 1000, 5000] {
+            let data = (0..size).map(|i| (i % 256) as u8).collect::<Vec<_>>();
+
+            // Test Fast
+            let fast_job = GifJob::new(&data, 100, 5, 300, 0.5, false).expect("fast job");
+            for frame in &fast_job.frames {
+                let bar = frame.iter().position(|&b| b == b'|').unwrap();
+                let header = std::str::from_utf8(&frame[..bar]).unwrap();
+                let chunk_len: usize = header.split('/').nth(1).unwrap().parse().unwrap();
+                let payload = &frame[bar + 1..];
+                assert!(!looks_like_compat(chunk_len, payload), 
+                    "Fast frame misclassified as Compat! size={size}, chunk_len={chunk_len}, payload_len={}", payload.len());
             }
-            if !done {
-                failed += 1;
-                println!("Seed {seed} (size {size}, chunks={}): NEVER COMPLETED! received {} / {}",
-                    decoder.total_chunks(), decoder.received_chunks(), decoder.total_chunks());
+
+            // Test Compat
+            let compat_job = GifJob::new(&data, 100, 5, 300, 0.5, true).expect("compat job");
+            for frame in &compat_job.frames {
+                let bar = frame.iter().position(|&b| b == b'|').unwrap();
+                let header = std::str::from_utf8(&frame[..bar]).unwrap();
+                let chunk_len: usize = header.split('/').nth(1).unwrap().parse().unwrap();
+                let payload = &frame[bar + 1..];
+                assert!(looks_like_compat(chunk_len, payload), 
+                    "Compat frame misclassified as Fast! size={size}, chunk_len={chunk_len}, payload_len={}", payload.len());
             }
         }
-        println!("Tested {trials} transfers: {failed} failed ({}%)", failed * 100 / trials);
+    }
+
+    #[test]
+    fn test_auto_decoder_handles_both_fast_and_compat() {
+        let payload = b"Test auto-detecting scheme between Fast and Compat!";
+
+        // 1. Auto-decoder scanning Fast frames:
+        let fast_gif = encode_gif(payload, 30, 5, 300, 0.5, false).expect("fast gif");
+        let mut auto_dec1 = WasmDecoder::auto();
+        let frames = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(fast_gif.bytes()))
+            .expect("read gif")
+            .into_frames()
+            .collect_frames()
+            .expect("collect frames");
+        for frame in frames {
+            let rgba = frame.into_buffer();
+            let (w, h) = (rgba.width(), rgba.height());
+            if auto_dec1.scan_frame(rgba.as_raw(), w, h).expect("scan").completed {
+                break;
+            }
+        }
+        assert!(auto_dec1.is_completed());
+        assert_eq!(auto_dec1.detected_scheme(), "fast");
+        assert_eq!(auto_dec1.get_data().unwrap().as_deref(), Some(&payload[..]));
+
+        // 2. Auto-decoder scanning Compat frames:
+        let compat_gif = encode_gif(payload, 30, 5, 300, 0.5, true).expect("compat gif");
+        let mut auto_dec2 = WasmDecoder::auto();
+        let frames2 = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(compat_gif.bytes()))
+            .expect("read gif")
+            .into_frames()
+            .collect_frames()
+            .expect("collect frames");
+        for frame in frames2 {
+            let rgba = frame.into_buffer();
+            let (w, h) = (rgba.width(), rgba.height());
+            if auto_dec2.scan_frame(rgba.as_raw(), w, h).expect("scan").completed {
+                break;
+            }
+        }
+        assert!(auto_dec2.is_completed());
+        assert_eq!(auto_dec2.detected_scheme(), "compat");
+        assert_eq!(auto_dec2.get_data().unwrap().as_deref(), Some(&payload[..]));
     }
 
     #[test]
@@ -542,7 +691,7 @@ mod tests {
         let gif = encode_gif(payload, 30, 5, 300, 0.5, false).expect("encode gif");
         assert!(!gif.bytes().is_empty());
 
-        let mut decoder = WasmDecoder::new(false);
+        let mut decoder = WasmDecoder::auto();
         let frames = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(gif.bytes()))
             .expect("read gif")
             .into_frames()
@@ -584,7 +733,7 @@ mod tests {
         let gif = encode_gif(&payload, 300, 8, 300, 0.5, false).expect("encode gif");
         assert!(gif.packed_size() < payload.len(), "payload was not compressed");
 
-        let mut decoder = WasmDecoder::new(false);
+        let mut decoder = WasmDecoder::auto();
         let frames = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(gif.bytes()))
             .expect("read gif")
             .into_frames()

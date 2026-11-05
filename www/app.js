@@ -436,8 +436,8 @@ function stopCamera() {
 }
 
 function initDecoder() {
-  const isCompat = document.getElementById('cfg-scheme').value === 'compat';
-  decoder = new WasmDecoder(isCompat);
+  // Auto-detect scheme on incoming frames (Fast vs Compat)
+  decoder = new WasmDecoder();
   progressBar.style.width = '0%';
   statRecvChunks.textContent = '0 / 0';
   statRecvPercent.textContent = '0%';
@@ -541,6 +541,9 @@ function processCameraFrame() {
       missStreak = 0;
       showTrackBox(trackedBox, vw, vh);
 
+      const scheme = decoder.detected_scheme();
+      const schemeTag = scheme ? ` [${scheme === 'compat' ? 'Compat' : 'Fast'}]` : '';
+
       if (res.new_frame) {
         scanPulse.className = 'pulse-dot pulse-active';
         scanStatusText.textContent = `捕获新块: ${res.received_chunks} / ${res.total_chunks}`;
@@ -589,7 +592,9 @@ function onTransferComplete() {
     return;
   }
   if (!recoveredPayload) return;
-  scanStatusText.textContent = '还原完毕！';
+  const scheme = decoder.detected_scheme();
+  const schemeLabel = scheme ? ` (${scheme === 'compat' ? 'Compat' : 'Fast'} 模式)` : '';
+  scanStatusText.textContent = `还原完毕！${schemeLabel}`;
   scanPulse.className = 'pulse-dot pulse-active';
   progressBar.style.width = '100%';
   statRecvPercent.textContent = '100%';
