@@ -45,8 +45,7 @@
       </div>
 
       <div class="card">
-        <details class="settings-accordion">
-          <summary class="card-title pointer">编码与动画参数设置</summary>
+          <summary class="card-title">编码与动画参数设置</summary>
           <div class="settings-grid">
             <div class="setting-item">
               <label for="cfg-chunk">单帧载荷 (Chunk Len)</label>
@@ -71,12 +70,11 @@
             <div class="setting-item">
               <label for="cfg-scheme">编码算法</label>
               <select id="cfg-scheme">
-                <option value="fast" selected>Fast (RaptorQ RFC 6330 - 极速)</option>
+                <option value="fast" selected>Fast (RaptorQ RFC 6330)</option>
                 <option value="compat">Compat (兼容原版 Go txqr)</option>
               </select>
             </div>
           </div>
-        </details>
 
         <button id="btn-generate" class="btn btn-primary btn-block">生成动态二维码 GIF</button>
         <div id="gen-progress" class="progress-bar-container hidden" style="margin-top: 8px;">

@@ -124,11 +124,6 @@ body {
   color: var(--ink);
 }
 
-.card-title.pointer {
-  cursor: pointer;
-  user-select: none;
-}
-
 input[type="radio"] {
   accent-color: var(--ink);
 }
@@ -209,7 +204,7 @@ input[type="radio"] {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
   gap: 12px;
-  margin-top: 14px;
+  margin-top: 2px;
 }
 
 .setting-item {

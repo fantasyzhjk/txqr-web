@@ -508,6 +508,35 @@ mod tests {
     use image::AnimationDecoder;
 
     #[test]
+    fn test_compat_encode_and_scan_flow() {
+        // Let's test if ALL 2.0*k frames ALWAYS reach rank k, or if some fail!
+        let mut failed = 0;
+        let trials = 1000;
+        for seed in 0..trials {
+            // vary the size between 100 and 1500
+            let size = 100 + (seed * 17) % 1400;
+            let payload: Vec<u8> = (0..size).map(|i| ((i * 31 + seed) % 256) as u8).collect();
+            let mut job = GifJob::new(&payload, 100, 5, 300, 0.5, true).expect("encode gif");
+            job.step(usize::MAX).expect("step");
+
+            let mut decoder = WasmDecoder::new(true);
+            let mut done = false;
+            for frame in &job.frames {
+                if decoder.add_frame(frame).expect("add frame") {
+                    done = true;
+                    break;
+                }
+            }
+            if !done {
+                failed += 1;
+                println!("Seed {seed} (size {size}, chunks={}): NEVER COMPLETED! received {} / {}",
+                    decoder.total_chunks(), decoder.received_chunks(), decoder.total_chunks());
+            }
+        }
+        println!("Tested {trials} transfers: {failed} failed ({}%)", failed * 100 / trials);
+    }
+
+    #[test]
     fn test_encode_and_scan_flow() {
         let payload = b"Hello from txqr air-gapped web transfer!";
         let gif = encode_gif(payload, 30, 5, 300, 0.5, false).expect("encode gif");
