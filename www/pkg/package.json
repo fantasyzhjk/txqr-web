@@ -1,0 +1,16 @@
+{
+  "name": "txqr-wasm",
+  "type": "module",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "files": [
+    "txqr_wasm_bg.wasm",
+    "txqr_wasm.js",
+    "txqr_wasm.d.ts"
+  ],
+  "main": "txqr_wasm.js",
+  "types": "txqr_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
