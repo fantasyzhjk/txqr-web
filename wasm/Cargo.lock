@@ -354,10 +354,11 @@ dependencies = [
 
 [[package]]
 name = "txqr"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "crc32fast",
+ "flate2",
  "gif",
  "image",
  "qrcode",
@@ -371,7 +372,6 @@ name = "txqr-wasm"
 version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
- "flate2",
  "image",
  "quircs",
  "txqr",

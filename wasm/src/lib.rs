@@ -1,8 +1,4 @@
-use flate2::read::DeflateDecoder;
-use flate2::write::DeflateEncoder;
-use flate2::Compression;
 use quircs::Quirc;
-use std::io::{Read, Write};
 use txqr::qr::{ErrorCorrection, QrGifBuilder};
 use txqr::{Decoder, Encoder, Scheme};
 use wasm_bindgen::prelude::*;
@@ -78,79 +74,6 @@ fn bbox(mut hit: QrHit, corners: &[quircs::Point; 4], width: usize, height: usiz
     hit
 }
 
-/// Marks a payload that was compressed before transmission. Without it a receiver cannot
-/// tell compressed bytes from raw ones, so it travels inside the payload itself instead of
-/// being a sender/receiver setting that can drift out of sync.
-const COMPRESSED_MAGIC: &[u8; 4] = b"TQf1";
-
-/// Near-8-bit entropy means deflate will fail on this payload. Checking that first skips the
-/// compressor entirely; this is a single pass over a 64 KiB sample.
-fn looks_random(data: &[u8]) -> bool {
-    const SAMPLE: usize = 64 * 1024;
-    let step = (data.len() / SAMPLE).max(1);
-
-    let mut counts = [0u32; 256];
-    let mut total = 0u32;
-    for byte in data.iter().step_by(step) {
-        counts[*byte as usize] += 1;
-        total += 1;
-    }
-
-    let total = total as f64;
-    let mut entropy = 0.0;
-    for count in counts {
-        if count > 0 {
-            let p = count as f64 / total;
-            entropy -= p * p.log2();
-        }
-    }
-    entropy > 7.9
-}
-
-/// Compresses `data` for transmission at maximum ratio, or returns it untouched when that
-/// would not pay off.
-fn pack(data: &[u8]) -> Result<Vec<u8>, wasm_bindgen::JsError> {
-    if looks_random(data) {
-        return Ok(data.to_vec());
-    }
-
-    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
-    encoder
-        .write_all(data)
-        .map_err(|e| wasm_bindgen::JsError::new(&format!("compression failed: {e}")))?;
-    let compressed = encoder
-        .finish()
-        .map_err(|e| wasm_bindgen::JsError::new(&format!("compression failed: {e}")))?;
-
-    let header = COMPRESSED_MAGIC.len() + 4;
-    if compressed.len() + header >= data.len() {
-        return Ok(data.to_vec());
-    }
-
-    let mut packed = Vec::with_capacity(header + compressed.len());
-    packed.extend_from_slice(COMPRESSED_MAGIC);
-    packed.extend_from_slice(&(data.len() as u32).to_le_bytes());
-    packed.extend_from_slice(&compressed);
-    Ok(packed)
-}
-
-/// Undoes [`pack`]. Payloads without the magic are returned as they are, so senders that do
-/// not compress stay readable.
-fn unpack(data: &[u8]) -> Result<Vec<u8>, wasm_bindgen::JsError> {
-    let header = COMPRESSED_MAGIC.len() + 4;
-    if data.len() < header || &data[..COMPRESSED_MAGIC.len()] != COMPRESSED_MAGIC {
-        return Ok(data.to_vec());
-    }
-
-    let mut expected = [0u8; 4];
-    expected.copy_from_slice(&data[COMPRESSED_MAGIC.len()..header]);
-    let mut out = Vec::with_capacity(u32::from_le_bytes(expected) as usize);
-    DeflateDecoder::new(&data[header..])
-        .read_to_end(&mut out)
-        .map_err(|e| wasm_bindgen::JsError::new(&format!("payload decompression failed: {e}")))?;
-    Ok(out)
-}
-
 #[wasm_bindgen]
 pub fn init_panic_hook() {
     console_error_panic_hook::set_once();
@@ -223,10 +146,10 @@ impl GifJob {
         compat: bool,
     ) -> Result<GifJob, wasm_bindgen::JsError> {
         let scheme = if compat { Scheme::Compat } else { Scheme::Fast };
-        let packed = pack(data)?;
-        let packed_size = packed.len();
-        let frames = Encoder::new(chunk_len, scheme, redundancy)
-            .encode(&packed)
+        // Compression lives in the library; Compat ignores the flag and stays Go-compatible.
+        let (frames, packed_size) = Encoder::new(chunk_len, scheme, redundancy)
+            .compressed(true)
+            .encode_with_len(data)
             .map_err(|e| wasm_bindgen::JsError::new(&e.to_string()))?;
         Ok(GifJob {
             matrices: Vec::with_capacity(frames.len()),
@@ -252,7 +175,11 @@ impl GifJob {
     }
 
     /// Pixel dimension (width and height) of a frame with `quiet_zone` modules added.
-    pub fn get_frame_dimension(&self, index: usize, quiet_zone: u32) -> Result<u32, wasm_bindgen::JsError> {
+    pub fn get_frame_dimension(
+        &self,
+        index: usize,
+        quiet_zone: u32,
+    ) -> Result<u32, wasm_bindgen::JsError> {
         let matrix = self
             .matrices
             .get(index)
@@ -262,7 +189,11 @@ impl GifJob {
 
     /// Flat RGBA pixel buffer (1 module = 1 pixel) for frame `index`, with `quiet_zone` border.
     /// Ready for direct painting via `ImageData` onto an HTML5 canvas.
-    pub fn get_frame_rgba(&self, index: usize, quiet_zone: u32) -> Result<Vec<u8>, wasm_bindgen::JsError> {
+    pub fn get_frame_rgba(
+        &self,
+        index: usize,
+        quiet_zone: u32,
+    ) -> Result<Vec<u8>, wasm_bindgen::JsError> {
         let matrix = self
             .matrices
             .get(index)
@@ -350,26 +281,37 @@ pub struct ScanResult {
     pub height: u32,
 }
 
-/// Inspects the frame's declared `chunk_len` and payload bytes to determine if it is Compat (Luby Transform)
-/// or Fast (RaptorQ RFC 6330).
-/// 1. Fast packets strictly have `chunk_len % 8 == 0` and `payload.len() == chunk_len`.
-/// 2. Compat packets are base64-partitioned text, so `payload.len() != chunk_len` almost always,
-///    and their degree-1 payloads are 100% valid ASCII Base64 characters.
-/// Inspects the frame's declared `chunk_len` and payload bytes to determine if it is Compat (Luby Transform)
-/// or Fast (RaptorQ RFC 6330).
-/// 1. Fast packets always have `payload.len() == chunk_len`.
-/// 2. Compat packets are base64-partitioned text (all bytes < 0x80), so any byte >= 0x80 implies Fast.
-/// 3. If all bytes < 0x80 and lengths match, pure Base64 alphabet characters imply Compat.
-fn looks_like_compat(chunk_len: usize, payload: &[u8]) -> bool {
-    if payload.len() != chunk_len {
-        return true;
+/// Guesses the scheme of the first frame from its declared `chunk_len` and payload, because the
+/// frame header does not say which scheme it belongs to.
+///
+/// * A Fast frame always carries exactly one RaptorQ symbol, and RaptorQ aligns symbol sizes to
+///   8 bytes, so `chunk_len % 8 != 0` or `payload.len() != chunk_len` means Compat.
+/// * A Compat payload is base64 text *until* blocks get XORed together, after which its bytes can
+///   be anything — so the alphabet check below only decides when it matches.
+///
+/// A Fast symbol that happens to be all base64 characters is the one case this gets wrong; the
+/// caller's alternative would be to buffer the transfer and retry under the other scheme.
+/// Guesses the scheme of the first frame; the header does not say which one it belongs to.
+///
+/// Compat splits the base64 text into `ceil(total/chunk_len)` near-equal blocks, so a Compat
+/// frame carries `floor(total/count)` or `ceil(total/count)` bytes — which is usually less than
+/// the declared `chunk_len`. A Fast frame carries exactly one RaptorQ symbol, so its payload is
+/// exactly `chunk_len` bytes.
+///
+/// When both lengths fit, only the bytes are left as a hint: untouched Compat blocks are base64
+/// text, but XORed ones are not, and a Fast symbol can be text too. That is the one ambiguous
+/// case, and it needs a transfer buffered under both schemes to resolve.
+fn looks_like_compat(chunk_len: usize, total: usize, payload: &[u8]) -> bool {
+    let count = total.div_ceil(chunk_len.max(1)).max(1);
+    let block_fits = payload.len() == total.div_ceil(count) || payload.len() == total / count;
+    let symbol_fits = payload.len() == chunk_len;
+    if block_fits != symbol_fits {
+        return block_fits;
     }
-    if payload.iter().any(|&b| b >= 0x80) {
-        return false;
-    }
-    payload.iter().all(|&b| {
-        b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='
-    })
+
+    payload
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
 }
 
 /// State machine decoder for receiving animated QR frames over camera or stream.
@@ -434,7 +376,10 @@ impl WasmDecoder {
         }
     }
 
-    fn ensure_decoder(&mut self, frame_bytes: &[u8]) -> Result<&mut Decoder, wasm_bindgen::JsError> {
+    fn ensure_decoder(
+        &mut self,
+        frame_bytes: &[u8],
+    ) -> Result<&mut Decoder, wasm_bindgen::JsError> {
         if self.inner.is_none() {
             let scheme = match self.forced_scheme {
                 Some(s) => s,
@@ -445,14 +390,12 @@ impl WasmDecoder {
                         .ok_or_else(|| wasm_bindgen::JsError::new("missing header delimiter"))?;
                     let header = std::str::from_utf8(&frame_bytes[..bar])
                         .map_err(|e| wasm_bindgen::JsError::new(&e.to_string()))?;
-                    let chunk_len: usize = header
-                        .split('/')
-                        .nth(1)
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0);
+                    let mut fields = header.split('/');
+                    let chunk_len: usize = fields.nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let total: usize = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
                     let payload = &frame_bytes[bar + 1..];
 
-                    if looks_like_compat(chunk_len, payload) {
+                    if looks_like_compat(chunk_len, total, payload) {
                         Scheme::Compat
                     } else {
                         Scheme::Fast
@@ -496,9 +439,7 @@ impl WasmDecoder {
         }
 
         let gray = rgba_to_grayscale(rgba, width as usize, height as usize);
-        let hit = self
-            .reader
-            .read(&gray, width as usize, height as usize);
+        let hit = self.reader.read(&gray, width as usize, height as usize);
 
         let Some(hit) = hit else {
             self.last_qr_detected = false;
@@ -578,7 +519,9 @@ impl WasmDecoder {
     }
 
     pub fn progress(&self) -> f32 {
-        let Some(inner) = &self.inner else { return 0.0; };
+        let Some(inner) = &self.inner else {
+            return 0.0;
+        };
         let total = inner.chunk_count();
         if total == 0 {
             0.0
@@ -588,11 +531,12 @@ impl WasmDecoder {
     }
 
     pub fn get_data(&self) -> Result<Option<Vec<u8>>, wasm_bindgen::JsError> {
-        let Some(inner) = &self.inner else { return Ok(None); };
-        match inner.data() {
-            Some(data) => unpack(data).map(Some),
-            None => Ok(None),
-        }
+        // The library hands out the payload already decompressed.
+        Ok(self
+            .inner
+            .as_ref()
+            .and_then(|inner| inner.data())
+            .map(<[u8]>::to_vec))
     }
 }
 
@@ -600,18 +544,6 @@ impl WasmDecoder {
 mod tests {
     use super::*;
     use image::AnimationDecoder;
-
-    fn looks_like_compat(chunk_len: usize, payload: &[u8]) -> bool {
-        if payload.len() != chunk_len {
-            return true;
-        }
-        if chunk_len % 8 != 0 {
-            return true;
-        }
-        payload.iter().all(|&b| {
-            b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='
-        })
-    }
 
     #[test]
     fn test_looks_like_compat() {
@@ -623,10 +555,15 @@ mod tests {
             for frame in &fast_job.frames {
                 let bar = frame.iter().position(|&b| b == b'|').unwrap();
                 let header = std::str::from_utf8(&frame[..bar]).unwrap();
-                let chunk_len: usize = header.split('/').nth(1).unwrap().parse().unwrap();
+                let mut fields = header.split('/');
+                let chunk_len: usize = fields.nth(1).unwrap().parse().unwrap();
+                let total: usize = fields.next().unwrap().parse().unwrap();
                 let payload = &frame[bar + 1..];
-                assert!(!looks_like_compat(chunk_len, payload), 
-                    "Fast frame misclassified as Compat! size={size}, chunk_len={chunk_len}, payload_len={}", payload.len());
+                assert!(
+                    !looks_like_compat(chunk_len, total, payload),
+                    "Fast frame misclassified as Compat! size={size}, chunk_len={chunk_len}, payload_len={}",
+                    payload.len()
+                );
             }
 
             // Test Compat
@@ -634,10 +571,28 @@ mod tests {
             for frame in &compat_job.frames {
                 let bar = frame.iter().position(|&b| b == b'|').unwrap();
                 let header = std::str::from_utf8(&frame[..bar]).unwrap();
-                let chunk_len: usize = header.split('/').nth(1).unwrap().parse().unwrap();
+                let mut fields = header.split('/');
+                let chunk_len: usize = fields.nth(1).unwrap().parse().unwrap();
+                let total: usize = fields.next().unwrap().parse().unwrap();
                 let payload = &frame[bar + 1..];
-                assert!(looks_like_compat(chunk_len, payload), 
-                    "Compat frame misclassified as Fast! size={size}, chunk_len={chunk_len}, payload_len={}", payload.len());
+
+                // A blend of several Compat blocks can be exactly as long as the budget and no
+                // longer base64; a Fast symbol would look identical, so nothing decides it.
+                let count = total.div_ceil(chunk_len.max(1)).max(1);
+                let ambiguous = payload.len() == chunk_len
+                    && (payload.len() == total.div_ceil(count) || payload.len() == total / count);
+                let base64 = payload
+                    .iter()
+                    .all(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=');
+                if ambiguous && !base64 {
+                    continue;
+                }
+
+                assert!(
+                    looks_like_compat(chunk_len, total, payload),
+                    "Compat frame misclassified as Fast! size={size}, chunk_len={chunk_len}, payload_len={}",
+                    payload.len()
+                );
             }
         }
     }
@@ -657,7 +612,11 @@ mod tests {
         for frame in frames {
             let rgba = frame.into_buffer();
             let (w, h) = (rgba.width(), rgba.height());
-            if auto_dec1.scan_frame(rgba.as_raw(), w, h).expect("scan").completed {
+            if auto_dec1
+                .scan_frame(rgba.as_raw(), w, h)
+                .expect("scan")
+                .completed
+            {
                 break;
             }
         }
@@ -676,7 +635,11 @@ mod tests {
         for frame in frames2 {
             let rgba = frame.into_buffer();
             let (w, h) = (rgba.width(), rgba.height());
-            if auto_dec2.scan_frame(rgba.as_raw(), w, h).expect("scan").completed {
+            if auto_dec2
+                .scan_frame(rgba.as_raw(), w, h)
+                .expect("scan")
+                .completed
+            {
                 break;
             }
         }
@@ -708,7 +671,12 @@ mod tests {
                 // image and roughly code-sized.
                 assert!(result.width > 0 && result.height > 0, "empty box");
                 assert!(result.x + result.width <= w && result.y + result.height <= h);
-                assert!(result.width >= w / 2, "box {} too small for image {}", result.width, w);
+                assert!(
+                    result.width >= w / 2,
+                    "box {} too small for image {}",
+                    result.width,
+                    w
+                );
             }
             if result.completed {
                 done = true;
@@ -723,15 +691,18 @@ mod tests {
         );
     }
 
-    /// Compression has to survive the whole pipe: pack -> GIF -> camera frames -> unpack.
+    /// Compression has to survive the whole pipe: encode -> GIF -> camera frames -> decode.
     #[test]
     fn compressed_payload_survives_the_gif_round_trip() {
         let payload: Vec<u8> = b"the quick brown fox jumps over the lazy dog.
 "
-            .repeat(60)
-            .to_vec();
+        .repeat(60)
+        .to_vec();
         let gif = encode_gif(&payload, 300, 8, 300, 0.5, false).expect("encode gif");
-        assert!(gif.packed_size() < payload.len(), "payload was not compressed");
+        assert!(
+            gif.packed_size() < payload.len(),
+            "payload was not compressed"
+        );
 
         let mut decoder = WasmDecoder::auto();
         let frames = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(gif.bytes()))
@@ -743,7 +714,11 @@ mod tests {
         for frame in frames {
             let rgba = frame.into_buffer();
             let (w, h) = (rgba.width(), rgba.height());
-            if decoder.scan_frame(rgba.as_raw(), w, h).expect("scan frame").completed {
+            if decoder
+                .scan_frame(rgba.as_raw(), w, h)
+                .expect("scan frame")
+                .completed
+            {
                 break;
             }
         }
@@ -752,51 +727,6 @@ mod tests {
             decoder.get_data().expect("decode payload").as_deref(),
             Some(&payload[..])
         );
-    }
-
-    /// The short payload above is small enough that compression barely helps; this one is long
-    /// and repetitive, which is the case compression is for.
-    #[test]
-    fn compresses_repetitive_payloads() {
-        let data: Vec<u8> = b"txqr air-gap transfer, line after line.\n"
-            .repeat(400)
-            .to_vec();
-        let packed = pack(&data).expect("pack");
-        assert_eq!(&packed[..4], COMPRESSED_MAGIC);
-        assert!(packed.len() * 4 < data.len(), "packed {} vs {} bytes", packed.len(), data.len());
-        assert_eq!(unpack(&packed).expect("unpack"), data);
-    }
-
-    /// Already-compressed payloads must travel verbatim: the size check catches the ones that
-    /// cannot shrink (JPEG, media, archives).
-    #[test]
-    fn leaves_compressed_payloads_alone() {
-        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
-        jpeg.extend((0..65536u32).map(pseudo_random_byte));
-        assert_eq!(pack(&jpeg).expect("pack"), jpeg);
-    }
-
-    /// Random-looking bytes are recognised before deflate runs, not after it wastes time.
-    #[test]
-    fn detects_random_payloads_cheaply() {
-        let random: Vec<u8> = (0..1_000_000u32).map(pseudo_random_byte).collect();
-        assert!(looks_random(&random));
-
-        let text = b"fn main() { println!(\"hello\"); }
-".repeat(5000);
-        assert!(!looks_random(&text));
-
-        let packed = pack(&random).expect("pack");
-        assert_eq!(packed.len(), random.len());
-    }
-
-    /// Uncompressed but incompressible data must never come out bigger than it went in.
-    #[test]
-    fn never_expands_a_payload() {
-        let data: Vec<u8> = (0..8192u32).map(pseudo_random_byte).collect();
-        let packed = pack(&data).expect("pack");
-        assert!(packed.len() <= data.len(), "packed {} > {}", packed.len(), data.len());
-        assert_eq!(unpack(&packed).expect("unpack"), data);
     }
 
     #[test]
@@ -817,15 +747,9 @@ mod tests {
         // Border corners must be white (quiet zone)
         assert_eq!(&rgba[0..4], &[255, 255, 255, 255]);
         // There must be some dark pixels in the QR code
-        assert!(rgba.chunks_exact(4).any(|p| p[0] == 0 && p[1] == 0 && p[2] == 0));
-    }
-
-    /// xorshift32: deterministic, and unstructured enough that no compressor can exploit it.
-    fn pseudo_random_byte(i: u32) -> u8 {
-        let mut x = i.wrapping_mul(2_654_435_761).wrapping_add(0x9E37_79B9) | 1;
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        (x >> 7) as u8
+        assert!(
+            rgba.chunks_exact(4)
+                .any(|p| p[0] == 0 && p[1] == 0 && p[2] == 0)
+        );
     }
 }

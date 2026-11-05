@@ -11,10 +11,9 @@ wasm-opt = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-txqr = { path = "../../txqr-rs/txqr", features = ["qr"] }
+txqr = { path = "../txqr-rs/txqr", features = ["qr", "compress"] }
 wasm-bindgen = "0.2"
 quircs = "0.10"
-flate2 = "1"
 console_error_panic_hook = "0.1"
 
 [dev-dependencies]

@@ -2,7 +2,9 @@
 
 基于 WebAssembly (WASM) 的纯前端动态二维码（txqr）发送与移动端扫描还原系统。
 
-- **发送端 (Sender)**：支持拖入文件或输入文本，先用 Deflate (flate2, level 9) 压缩（压不动或本身就是已压缩格式时自动跳过），再用 RaptorQ (RFC 6330) 喷泉码切片编码，生成循环播放的动画 GIF。
+- **在线演示**：<https://fantasyzhjk.github.io/txqr-web/>
+
+- **发送端 (Sender)**：支持拖入文件或输入文本，Fast 模式下先用 Deflate (level 9) 压缩（压不动或本身就是已压缩格式时自动跳过），再用 RaptorQ (RFC 6330) 喷泉码切片编码，生成循环播放的动画 GIF。Compat 模式（兼容 Go 版接收端）从不压缩，保证线上字节与 Go 编码器一致。
 - **接收端 (Receiver)**：支持手机或电脑浏览器直接调用摄像头实时捕获屏幕上的二维码，WASM 高速解码并重组文件，零后端、零数据外泄。
 
 ## 目录结构
@@ -57,5 +59,4 @@ cargo build --release --target wasm32-unknown-unknown
 wasm-bindgen --target web --out-dir ../www/pkg --out-name txqr_wasm   target/wasm32-unknown-unknown/release/txqr_wasm.wasm
 ```
 
-（`wasm-pack` 亦可，本机未安装时用上面两条命令等价。）二维码识别用的是 `quircs`（quirc 的 Rust 移植，面向实时相机画面），
-解码后会返回二维码的外接矩形，前端据此锁定区域，后续帧只解码这一小块。
+（`wasm-pack` 亦可，本机未安装时用上面两条命令等价。）
