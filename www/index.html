@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>txqr Web - 跨物理隔离动态二维码传输</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-container">
+    <header class="app-header">
+      <div class="brand">
+        <h1>txqr <span class="tag">Web</span></h1>
+      </div>
+      <div id="wasm-status" class="status-badge loading">正在加载 WASM...</div>
+    </header>
+
+    <nav class="nav-tabs">
+      <button class="tab-btn active" data-tab="sender">发送端 (生成 GIF)</button>
+      <button class="tab-btn" data-tab="receiver">接收端 (相机扫描)</button>
+    </nav>
+
+    <!-- SENDER TAB -->
+    <main id="tab-sender" class="tab-content active">
+      <div class="card">
+        <div class="card-title">1. 选择传输内容</div>
+        
+        <div class="input-mode-toggle">
+          <label><input type="radio" name="input-mode" value="file" checked> 文件传输</label>
+          <label><input type="radio" name="input-mode" value="text"> 文本 / 密钥</label>
+        </div>
+
+        <div id="file-dropzone" class="dropzone">
+          <input type="file" id="file-input" class="file-hidden-input">
+          <div class="dropzone-prompt">
+            <p>点击选择文件 或 拖拽文件到此处</p>
+            <span id="file-info" class="file-info-text">支持任意格式文件</span>
+          </div>
+        </div>
+
+        <div id="text-input-container" class="text-input-container hidden">
+          <textarea id="text-input" placeholder="输入要传输的文本、私钥或配置数据..." rows="5"></textarea>
+          <div class="text-counter"><span id="text-bytes">0</span> 字节</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <details class="settings-accordion">
+          <summary class="card-title pointer">编码与动画参数设置</summary>
+          <div class="settings-grid">
+            <div class="setting-item">
+              <label for="cfg-chunk">单帧载荷 (Chunk Len)</label>
+              <input type="number" id="cfg-chunk" value="650" min="20" max="1000">
+              <small>每帧字节数，越小二维码越稀疏易扫</small>
+            </div>
+            <div class="setting-item">
+              <label for="cfg-fps">播放帧率 (FPS)</label>
+              <input type="number" id="cfg-fps" value="15" min="1" max="15">
+              <small>每秒动画帧数（越高传得越快，需相机跟得上）</small>
+            </div>
+            <div class="setting-item">
+              <label for="cfg-redundancy">喷泉码冗余度</label>
+              <input type="number" id="cfg-redundancy" value="0.5" min="0.0" max="2.0" step="0.1">
+              <small>0.5 表示生成 50% 额外修复帧</small>
+            </div>
+            <div class="setting-item">
+              <label for="cfg-size">目标分辨率 (px)</label>
+              <input type="number" id="cfg-size" value="640" min="200" max="800" step="20">
+              <small>生成二维码图边长像素</small>
+            </div>
+            <div class="setting-item">
+              <label for="cfg-scheme">编码算法</label>
+              <select id="cfg-scheme">
+                <option value="fast" selected>Fast (RaptorQ RFC 6330 - 极速)</option>
+                <option value="compat">Compat (兼容原版 Go txqr)</option>
+              </select>
+            </div>
+          </div>
+        </details>
+
+        <button id="btn-generate" class="btn btn-primary btn-block">生成动态二维码 GIF</button>
+        <div id="gen-progress" class="progress-bar-container hidden" style="margin-top: 8px;">
+          <div id="gen-progress-bar" class="progress-bar-fill" style="width: 0%;"></div>
+        </div>
+      </div>
+
+      <div id="sender-output" class="card output-card hidden">
+        <div class="card-title">2. 动态二维码展示</div>
+        
+        <div class="preview-area">
+          <div class="gif-container" id="gif-fullscreen-wrapper">
+            <canvas id="qr-canvas"></canvas>
+          </div>
+        </div>
+
+        <div class="stats-row">
+          <div class="stat"><span class="stat-label">数据大小</span><span id="stat-data-size" class="stat-val">-</span></div>
+          <div class="stat"><span class="stat-label">总帧数</span><span id="stat-frame-count" class="stat-val">-</span></div>
+          <div class="stat"><span class="stat-label">单循环耗时</span><span id="stat-loop-time" class="stat-val">-</span></div>
+        </div>
+
+        <div class="action-buttons">
+          <button id="btn-download-gif" class="btn btn-secondary">下载 GIF 动图</button>
+          <button id="btn-fullscreen" class="btn btn-secondary">全屏显示</button>
+        </div>
+      </div>
+    </main>
+
+    <!-- RECEIVER TAB -->
+    <main id="tab-receiver" class="tab-content">
+      <div class="card">
+        <div class="card-title">相机对准屏幕二维码</div>
+
+        <div class="camera-viewport">
+          <video id="camera-video" playsinline autoplay muted></video>
+          <canvas id="camera-canvas" class="hidden"></canvas>
+          <div id="track-box" class="track-box"></div>
+          <div id="camera-hint" class="camera-hint">请开启摄像头开始扫描</div>
+        </div>
+
+        <div class="camera-controls">
+          <button id="btn-toggle-camera" class="btn btn-primary">开启摄像头</button>
+          <button id="btn-switch-camera" class="btn btn-secondary" disabled>翻转镜头</button>
+          <select id="camera-select" class="camera-select hidden"></select>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">还原进度</div>
+        
+        <div class="scan-status-indicator">
+          <div id="scan-pulse" class="pulse-dot"></div>
+          <span id="scan-status-text">未开始扫描</span>
+        </div>
+
+        <div class="progress-bar-container">
+          <div id="progress-bar" class="progress-bar-fill" style="width: 0%;"></div>
+        </div>
+
+        <div class="stats-row">
+          <div class="stat"><span class="stat-label">已接收数据块</span><span id="stat-recv-chunks" class="stat-val">0 / 0</span></div>
+          <div class="stat"><span class="stat-label">进度百分比</span><span id="stat-recv-percent" class="stat-val">0%</span></div>
+          <div class="stat"><span class="stat-label">耗时</span><span id="stat-scan-timer" class="stat-val">0.0s</span></div>
+          <div class="stat"><span class="stat-label">扫描速度</span><span id="stat-scan-perf" class="stat-val">-</span></div>
+        </div>
+
+        <div id="decode-result-box" class="result-box hidden">
+          <div class="result-header">
+            <strong>数据传输还原成功！</strong>
+          </div>
+          <img id="result-image" class="result-image hidden" alt="还原的图片">
+          <div id="result-text-preview" class="result-text-preview hidden"></div>
+          <div class="action-buttons">
+            <button id="btn-download-result" class="btn btn-primary">下载还原文件</button>
+            <button id="btn-copy-result" class="btn btn-secondary hidden">复制文本</button>
+            <button id="btn-scan-again" class="btn btn-secondary">再次扫描</button>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

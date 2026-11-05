@@ -1,0 +1,21 @@
+[package]
+name = "txqr-wasm"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+txqr = { path = "../../txqr-rs/txqr", features = ["qr"] }
+wasm-bindgen = "0.2"
+quircs = "0.10"
+flate2 = "1"
+console_error_panic_hook = "0.1"
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["gif"] }
